@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: taskque
+      POSTGRES_PASSWORD: taskque123
+      POSTGRES_DB: taskque
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    ports:
+      - "3333:3333"
+    environment:
+      DATABASE_URL: postgres://taskque:taskque123@db:5432/taskque
+      PORT: 3333
+      JWT_SECRET: taskque-production-secret-altere-isso
+    depends_on:
+      db:
+        condition: service_started
+
+volumes:
+  pgdata:
