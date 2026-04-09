@@ -4,7 +4,7 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
-import { initDb } from "./db.js";
+import { initDb, prisma } from "./db.js";
 import { store } from "./store.js";
 import {
   hashPassword,
@@ -14,6 +14,10 @@ import {
   socketAuthMiddleware,
 } from "./auth.js";
 import type { User, Task } from "./types.js";
+import { COLUMNS } from "./types.js";
+import { welcomeEmail, taskAssignedEmail, taskStatusEmail } from "./mail.js";
+
+const STATUS_LABEL: Record<string, string> = Object.fromEntries(COLUMNS.map((c) => [c.key, c.label]));
 
 const app = express();
 app.use(cors());
@@ -23,6 +27,10 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
+
+function generateTempPassword(): string {
+  return Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-4).toUpperCase();
+}
 
 // ===== Auth Routes (public) =====
 app.post("/api/auth/login", async (req, res) => {
@@ -35,6 +43,11 @@ app.post("/api/auth/login", async (req, res) => {
   const user = await store.getUserByEmail(email);
   if (!user || !user.passwordHash) {
     res.status(401).json({ error: "Credenciais inválidas" });
+    return;
+  }
+
+  if (!user.active) {
+    res.status(403).json({ error: "Conta desativada. Contate o administrador." });
     return;
   }
 
@@ -66,7 +79,10 @@ app.put("/api/auth/profile", authMiddleware, async (req, res) => {
   if (name) data.name = name;
   if (avatar) data.avatar = avatar;
   if (color) data.color = color;
-  if (password) data.passwordHash = await hashPassword(password);
+  if (password) {
+    data.passwordHash = await hashPassword(password);
+    data.mustChangePassword = false;
+  }
 
   const user = await store.updateUser(req.user!.id, data);
   if (!user) {
@@ -87,9 +103,9 @@ app.post("/api/users", authMiddleware, async (req, res) => {
     return;
   }
 
-  const { name, email, password, avatar, color, role } = req.body;
-  if (!name || !email || !password) {
-    res.status(400).json({ error: "Nome, email e senha são obrigatórios" });
+  const { name, email, avatar, color, role } = req.body;
+  if (!name || !email) {
+    res.status(400).json({ error: "Nome e email são obrigatórios" });
     return;
   }
 
@@ -99,19 +115,43 @@ app.post("/api/users", authMiddleware, async (req, res) => {
     return;
   }
 
+  const tempPassword = generateTempPassword();
+
   const user = await store.createUser({
     id: uuidv4(),
     name,
     email,
-    passwordHash: await hashPassword(password),
+    passwordHash: await hashPassword(tempPassword),
     avatar: avatar || name.slice(0, 2).toUpperCase(),
     color: color || "#3b82f6",
     role: role || "member",
+    mustChangePassword: true,
     createdAt: new Date().toISOString(),
   });
 
   io.emit("user:created", user);
+  welcomeEmail(user.name, email, tempPassword);
   res.status(201).json(user);
+});
+
+app.patch("/api/users/:id/toggle-active", authMiddleware, async (req, res) => {
+  if (req.user!.role !== "admin") {
+    res.status(403).json({ error: "Apenas admins podem ativar/desativar usuários" });
+    return;
+  }
+
+  const userId = req.params.id as string;
+  const current = await store.getUserById(userId);
+  if (!current) {
+    res.status(404).json({ error: "Usuário não encontrado" });
+    return;
+  }
+
+  const user = await store.updateUser(userId, { active: !current.active });
+  if (user) {
+    io.emit("user:updated", user);
+    res.json(user);
+  }
 });
 
 app.delete("/api/users/:id", authMiddleware, async (req, res) => {
@@ -135,6 +175,12 @@ app.get("/api/tasks", authMiddleware, async (_req, res) => {
   res.json(await store.getTasks());
 });
 
+// ===== Comment Routes =====
+app.get("/api/tasks/:taskId/comments", authMiddleware, async (req, res) => {
+  const taskId = req.params.taskId as string;
+  res.json(await store.getCommentsByTaskId(taskId));
+});
+
 // ===== Socket.io =====
 io.use(socketAuthMiddleware);
 
@@ -148,23 +194,27 @@ io.on("connection", async (socket) => {
   socket.emit("init", { developers: users, tasks });
 
   // User events
-  socket.on("user:create", async (data: { name: string; email: string; password: string; avatar: string; color: string; role?: string }) => {
+  socket.on("user:create", async (data: { name: string; email: string; avatar: string; color: string; role?: string }) => {
     if (socket.data.user.role !== "admin") return;
 
     const existing = await store.getUserByEmail(data.email);
     if (existing) return;
 
+    const tempPassword = generateTempPassword();
+
     const user = await store.createUser({
       id: uuidv4(),
       name: data.name,
       email: data.email,
-      passwordHash: await hashPassword(data.password),
+      passwordHash: await hashPassword(tempPassword),
       avatar: data.avatar || data.name.slice(0, 2).toUpperCase(),
       color: data.color || "#3b82f6",
       role: (data.role as User["role"]) || "member",
+      mustChangePassword: true,
       createdAt: new Date().toISOString(),
     });
     io.emit("user:created", user);
+    welcomeEmail(user.name, data.email, tempPassword);
   });
 
   socket.on("user:update", async ({ id, data }: { id: string; data: Partial<User> }) => {
@@ -197,20 +247,87 @@ io.on("connection", async (socket) => {
       updatedAt: now,
     });
     io.emit("task:created", task);
+
+    // Notify assignee
+    if (task.assigneeId) {
+      const assignee = await store.getUserById(task.assigneeId);
+      if (assignee?.email) {
+        taskAssignedEmail(assignee.email, assignee.name, task.title, STATUS_LABEL[task.status] || task.status);
+      }
+    }
   });
 
   socket.on("task:update", async ({ id, data }: { id: string; data: Partial<Task> }) => {
+    const oldTask = data.assigneeId !== undefined ? await store.getUserById(id) : null;
     const task = await store.updateTask(id, data);
-    if (task) io.emit("task:updated", task);
+    if (task) {
+      io.emit("task:updated", task);
+
+      // Notify new assignee if changed
+      if (data.assigneeId && task.assigneeId) {
+        const assignee = await store.getUserById(task.assigneeId);
+        if (assignee?.email) {
+          taskAssignedEmail(assignee.email, assignee.name, task.title, STATUS_LABEL[task.status] || task.status);
+        }
+      }
+    }
   });
 
   socket.on("task:move", async ({ id, status }: { id: string; status: Task["status"] }) => {
+    // Get old status before update
+    const tasks = await store.getTasks();
+    const oldTask = tasks.find((t) => t.id === id);
+    const oldStatus = oldTask?.status;
+
     const task = await store.updateTask(id, { status });
-    if (task) io.emit("task:updated", task);
+    if (task) {
+      io.emit("task:updated", task);
+
+      // Notify assignee of status change
+      if (task.assigneeId && oldStatus && oldStatus !== status) {
+        const assignee = await store.getUserById(task.assigneeId);
+        if (assignee?.email) {
+          taskStatusEmail(
+            assignee.email,
+            assignee.name,
+            task.title,
+            STATUS_LABEL[oldStatus] || oldStatus,
+            STATUS_LABEL[status] || status,
+          );
+        }
+      }
+    }
   });
 
   socket.on("task:delete", async (id: string) => {
     if (await store.deleteTask(id)) io.emit("task:deleted", id);
+  });
+
+  // Comment events
+  socket.on("comment:create", async ({ taskId, content }: { taskId: string; content: string }) => {
+    if (!content.trim()) return;
+    const comment = await store.addComment({
+      id: uuidv4(),
+      content: content.trim(),
+      taskId,
+      authorId: socket.data.user.id,
+    });
+    io.emit("comment:created", comment);
+  });
+
+  socket.on("comment:delete", async (id: string) => {
+    const comment = await prisma.comment.findUnique({ where: { id } });
+    if (!comment) return;
+    // Only author or admin can delete
+    if (comment.authorId !== socket.data.user.id && socket.data.user.role !== "admin") return;
+    if (await store.deleteComment(id)) {
+      io.emit("comment:deleted", { id, taskId: comment.taskId });
+    }
+  });
+
+  socket.on("comment:list", async (taskId: string) => {
+    const comments = await store.getCommentsByTaskId(taskId);
+    socket.emit("comment:listed", { taskId, comments });
   });
 
   socket.on("disconnect", () => {
@@ -219,7 +336,7 @@ io.on("connection", async (socket) => {
 });
 
 // ===== Start =====
-const PORT = process.env.PORT || 3333;
+const PORT = process.env.PORT || 3002;
 
 async function start() {
   await initDb();

@@ -1,49 +1,52 @@
-import { pool } from "./db.js";
-import type { User, Task } from "./types.js";
+import { prisma } from "./db.js";
+import type { User, Task, Comment } from "./types.js";
+import type { User as PrismaUser, Task as PrismaTask } from "./generated/prisma/client.js";
 
-function toUser(row: Record<string, unknown>): User {
+function toUser(row: PrismaUser): User {
   return {
-    id: row.id as string,
-    name: row.name as string,
-    email: (row.email as string) || "",
-    avatar: row.avatar as string,
-    color: row.color as string,
-    role: (row.role as User["role"]) || "member",
-    createdAt: (row.created_at as Date).toISOString(),
+    id: row.id,
+    name: row.name,
+    email: row.email || "",
+    avatar: row.avatar,
+    color: row.color,
+    role: row.role,
+    active: row.active,
+    mustChangePassword: row.mustChangePassword,
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
-function toTask(row: Record<string, unknown>): Task {
+function toTask(row: PrismaTask): Task {
   return {
-    id: row.id as string,
-    title: row.title as string,
-    description: row.description as string,
-    status: row.status as Task["status"],
-    priority: row.priority as Task["priority"],
-    assigneeId: (row.assignee_id as string) || null,
-    startDate: row.start_date ? (row.start_date as Date).toISOString().split("T")[0] : null,
-    endDate: row.end_date ? (row.end_date as Date).toISOString().split("T")[0] : null,
-    createdAt: (row.created_at as Date).toISOString(),
-    updatedAt: (row.updated_at as Date).toISOString(),
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    status: row.status,
+    priority: row.priority,
+    assigneeId: row.assigneeId,
+    startDate: row.startDate ? row.startDate.toISOString().split("T")[0] : null,
+    endDate: row.endDate ? row.endDate.toISOString().split("T")[0] : null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
   };
 }
 
 export const store = {
   // Users
   async getUsers(): Promise<User[]> {
-    const { rows } = await pool.query("SELECT * FROM users ORDER BY created_at");
+    const rows = await prisma.user.findMany({ orderBy: { createdAt: "asc" } });
     return rows.map(toUser);
   },
 
   async getUserById(id: string): Promise<User | null> {
-    const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
-    return rows.length ? toUser(rows[0]) : null;
+    const row = await prisma.user.findUnique({ where: { id } });
+    return row ? toUser(row) : null;
   },
 
   async getUserByEmail(email: string): Promise<(User & { passwordHash: string }) | null> {
-    const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-    if (!rows.length) return null;
-    return { ...toUser(rows[0]), passwordHash: rows[0].password_hash as string };
+    const row = await prisma.user.findUnique({ where: { email } });
+    if (!row) return null;
+    return { ...toUser(row), passwordHash: row.passwordHash || "" };
   },
 
   async createUser(data: {
@@ -53,90 +56,158 @@ export const store = {
     passwordHash: string;
     avatar: string;
     color: string;
-    role: User["role"];
+    role: "admin" | "member";
+    active?: boolean;
+    mustChangePassword?: boolean;
     createdAt: string;
   }): Promise<User> {
-    const { rows } = await pool.query(
-      `INSERT INTO users (id, name, email, password_hash, avatar, color, role, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [data.id, data.name, data.email, data.passwordHash, data.avatar, data.color, data.role, data.createdAt]
-    );
-    return toUser(rows[0]);
+    const row = await prisma.user.create({
+      data: {
+        id: data.id,
+        name: data.name,
+        email: data.email,
+        passwordHash: data.passwordHash,
+        avatar: data.avatar,
+        color: data.color,
+        role: data.role,
+        active: data.active ?? true,
+        mustChangePassword: data.mustChangePassword ?? false,
+        createdAt: new Date(data.createdAt),
+      },
+    });
+    return toUser(row);
   },
 
   async updateUser(id: string, data: Partial<User & { passwordHash?: string }>): Promise<User | null> {
-    const fields: string[] = [];
-    const values: unknown[] = [];
-    let idx = 1;
+    const updateData: Record<string, unknown> = {};
 
-    if (data.name !== undefined) { fields.push(`name = $${idx++}`); values.push(data.name); }
-    if (data.email !== undefined) { fields.push(`email = $${idx++}`); values.push(data.email); }
-    if (data.avatar !== undefined) { fields.push(`avatar = $${idx++}`); values.push(data.avatar); }
-    if (data.color !== undefined) { fields.push(`color = $${idx++}`); values.push(data.color); }
-    if (data.role !== undefined) { fields.push(`role = $${idx++}`); values.push(data.role); }
-    if (data.passwordHash !== undefined) { fields.push(`password_hash = $${idx++}`); values.push(data.passwordHash); }
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.email !== undefined) updateData.email = data.email;
+    if (data.avatar !== undefined) updateData.avatar = data.avatar;
+    if (data.color !== undefined) updateData.color = data.color;
+    if (data.role !== undefined) updateData.role = data.role;
+    if (data.active !== undefined) updateData.active = data.active;
+    if (data.mustChangePassword !== undefined) updateData.mustChangePassword = data.mustChangePassword;
+    if (data.passwordHash !== undefined) updateData.passwordHash = data.passwordHash;
 
-    if (fields.length === 0) return null;
+    if (Object.keys(updateData).length === 0) return null;
 
-    values.push(id);
-    const { rows } = await pool.query(
-      `UPDATE users SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
-      values
-    );
-    return rows.length ? toUser(rows[0]) : null;
+    try {
+      const row = await prisma.user.update({ where: { id }, data: updateData });
+      return toUser(row);
+    } catch {
+      return null;
+    }
   },
 
   async deleteUser(id: string): Promise<boolean> {
-    const { rowCount } = await pool.query("DELETE FROM users WHERE id = $1", [id]);
-    return (rowCount ?? 0) > 0;
+    try {
+      await prisma.user.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   // Tasks
   async getTasks(): Promise<Task[]> {
-    const { rows } = await pool.query("SELECT * FROM tasks ORDER BY created_at");
+    const rows = await prisma.task.findMany({ orderBy: { createdAt: "asc" } });
     return rows.map(toTask);
   },
 
   async addTask(task: Task): Promise<Task> {
-    const { rows } = await pool.query(
-      `INSERT INTO tasks (id, title, description, status, priority, assignee_id, start_date, end_date, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       RETURNING *`,
-      [
-        task.id, task.title, task.description, task.status, task.priority,
-        task.assigneeId, task.startDate, task.endDate, task.createdAt, task.updatedAt,
-      ]
-    );
-    return toTask(rows[0]);
+    const row = await prisma.task.create({
+      data: {
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+        priority: task.priority,
+        assigneeId: task.assigneeId,
+        startDate: task.startDate ? new Date(task.startDate) : null,
+        endDate: task.endDate ? new Date(task.endDate) : null,
+        createdAt: new Date(task.createdAt),
+        updatedAt: new Date(task.updatedAt),
+      },
+    });
+    return toTask(row);
   },
 
   async updateTask(id: string, data: Partial<Task>): Promise<Task | null> {
-    const fields: string[] = [];
-    const values: unknown[] = [];
-    let idx = 1;
+    const updateData: Record<string, unknown> = {};
 
-    if (data.title !== undefined) { fields.push(`title = $${idx++}`); values.push(data.title); }
-    if (data.description !== undefined) { fields.push(`description = $${idx++}`); values.push(data.description); }
-    if (data.status !== undefined) { fields.push(`status = $${idx++}`); values.push(data.status); }
-    if (data.priority !== undefined) { fields.push(`priority = $${idx++}`); values.push(data.priority); }
-    if (data.assigneeId !== undefined) { fields.push(`assignee_id = $${idx++}`); values.push(data.assigneeId); }
-    if (data.startDate !== undefined) { fields.push(`start_date = $${idx++}`); values.push(data.startDate); }
-    if (data.endDate !== undefined) { fields.push(`end_date = $${idx++}`); values.push(data.endDate); }
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.description !== undefined) updateData.description = data.description;
+    if (data.status !== undefined) updateData.status = data.status;
+    if (data.priority !== undefined) updateData.priority = data.priority;
+    if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId;
+    if (data.startDate !== undefined) updateData.startDate = data.startDate ? new Date(data.startDate) : null;
+    if (data.endDate !== undefined) updateData.endDate = data.endDate ? new Date(data.endDate) : null;
 
-    fields.push(`updated_at = $${idx++}`);
-    values.push(new Date().toISOString());
-
-    values.push(id);
-    const { rows } = await pool.query(
-      `UPDATE tasks SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
-      values
-    );
-    return rows.length ? toTask(rows[0]) : null;
+    try {
+      const row = await prisma.task.update({ where: { id }, data: updateData });
+      return toTask(row);
+    } catch {
+      return null;
+    }
   },
 
   async deleteTask(id: string): Promise<boolean> {
-    const { rowCount } = await pool.query("DELETE FROM tasks WHERE id = $1", [id]);
-    return (rowCount ?? 0) > 0;
+    try {
+      await prisma.task.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // Comments
+  async getCommentsByTaskId(taskId: string): Promise<Comment[]> {
+    const rows = await prisma.comment.findMany({
+      where: { taskId },
+      include: { author: true },
+      orderBy: { createdAt: "asc" },
+    });
+    return rows.map((row) => ({
+      id: row.id,
+      content: row.content,
+      taskId: row.taskId,
+      authorId: row.authorId,
+      authorName: row.author.name,
+      authorAvatar: row.author.avatar,
+      authorColor: row.author.color,
+      createdAt: row.createdAt.toISOString(),
+    }));
+  },
+
+  async addComment(data: { id: string; content: string; taskId: string; authorId: string }): Promise<Comment> {
+    const row = await prisma.comment.create({
+      data: {
+        id: data.id,
+        content: data.content,
+        taskId: data.taskId,
+        authorId: data.authorId,
+      },
+      include: { author: true },
+    });
+    return {
+      id: row.id,
+      content: row.content,
+      taskId: row.taskId,
+      authorId: row.authorId,
+      authorName: row.author.name,
+      authorAvatar: row.author.avatar,
+      authorColor: row.author.color,
+      createdAt: row.createdAt.toISOString(),
+    };
+  },
+
+  async deleteComment(id: string): Promise<boolean> {
+    try {
+      await prisma.comment.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
   },
 };

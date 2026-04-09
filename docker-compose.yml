@@ -7,18 +7,18 @@ services:
       POSTGRES_PASSWORD: taskque123
       POSTGRES_DB: taskque
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
   api:
-    build: ./api
+    build: .
     restart: unless-stopped
     ports:
-      - "3333:3333"
+      - "3002:3002"
     environment:
       DATABASE_URL: postgres://taskque:taskque123@db:5432/taskque
-      PORT: 3333
+      PORT: 3002
       JWT_SECRET: taskque-production-secret-altere-isso
     depends_on:
       db:

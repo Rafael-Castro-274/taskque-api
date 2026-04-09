@@ -5,6 +5,8 @@ export interface User {
   avatar: string;
   color: string;
   role: "admin" | "member";
+  active: boolean;
+  mustChangePassword: boolean;
   createdAt: string;
 }
 
@@ -21,6 +23,17 @@ export interface Task {
   endDate: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface Comment {
+  id: string;
+  content: string;
+  taskId: string;
+  authorId: string;
+  authorName: string;
+  authorAvatar: string;
+  authorColor: string;
+  createdAt: string;
 }
 
 export type TaskStatus = Task["status"];

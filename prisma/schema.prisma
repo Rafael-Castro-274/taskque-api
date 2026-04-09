@@ -1,0 +1,74 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  admin
+  member
+}
+
+enum TaskStatus {
+  backlog
+  todo
+  in_progress
+  review
+  done
+}
+
+enum TaskPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+model User {
+  id                 String   @id @default(uuid())
+  name               String
+  email              String?  @unique
+  passwordHash       String?  @map("password_hash")
+  avatar             String
+  color              String
+  role               Role     @default(member)
+  active             Boolean  @default(true)
+  mustChangePassword Boolean  @default(false) @map("must_change_password")
+  createdAt          DateTime @default(now()) @map("created_at")
+  tasks              Task[]   @relation("Assignee")
+  comments           Comment[]
+
+  @@map("users")
+}
+
+model Task {
+  id          String       @id @default(uuid())
+  title       String
+  description String       @default("")
+  status      TaskStatus   @default(backlog)
+  priority    TaskPriority @default(medium)
+  assigneeId  String?      @map("assignee_id")
+  assignee    User?        @relation("Assignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  startDate   DateTime?    @map("start_date") @db.Date
+  endDate     DateTime?    @map("end_date") @db.Date
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  comments    Comment[]
+
+  @@map("tasks")
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  content   String
+  taskId    String   @map("task_id")
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String   @map("author_id")
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("comments")
+}
