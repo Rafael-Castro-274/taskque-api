@@ -1,7 +1,7 @@
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-const FROM = process.env.RESEND_FROM || "TaskQue <noreply@taskque.com>";
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const FROM = process.env.EMAIL_FROM || process.env.RESEND_FROM || "TaskQue <noreply@taskque.com>";
 
 interface SendMailOptions {
   to: string;
@@ -10,7 +10,7 @@ interface SendMailOptions {
 }
 
 export async function sendMail({ to, subject, html }: SendMailOptions) {
-  if (!process.env.RESEND_API_KEY) {
+  if (!resend) {
     console.log(`[Mail] Skipped (no API key): ${subject} → ${to}`);
     return null;
   }

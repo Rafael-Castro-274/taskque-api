@@ -1,7 +1,7 @@
 services:
   db:
     image: postgres:16-alpine
-    restart: unless-stopped
+    restart: always
     environment:
       POSTGRES_USER: taskque
       POSTGRES_PASSWORD: taskque123
@@ -13,9 +13,11 @@ services:
 
   api:
     build: .
-    restart: unless-stopped
+    restart: always
     ports:
       - "3002:3002"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgres://taskque:taskque123@db:5432/taskque
       PORT: 3002
