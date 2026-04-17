@@ -13,9 +13,10 @@ import {
   authMiddleware,
   socketAuthMiddleware,
 } from "./auth.js";
-import type { User, Task } from "./types.js";
+import type { User, Task, Project } from "./types.js";
 import { COLUMNS } from "./types.js";
 import { welcomeEmail, taskAssignedEmail, taskStatusEmail } from "./mail.js";
+import { createBranch, isGithubConfigured, listUserRepos, listRepoBranches } from "./github.js";
 
 const STATUS_LABEL: Record<string, string> = Object.fromEntries(COLUMNS.map((c) => [c.key, c.label]));
 
@@ -175,6 +176,92 @@ app.get("/api/tasks", authMiddleware, async (_req, res) => {
   res.json(await store.getTasks());
 });
 
+// ===== GitHub Routes =====
+app.get("/api/github/status", authMiddleware, (_req, res) => {
+  res.json({ configured: isGithubConfigured() });
+});
+
+app.get("/api/github/repos", authMiddleware, async (_req, res) => {
+  const result = await listUserRepos();
+  if (!result.success) {
+    res.status(502).json({ error: result.error });
+    return;
+  }
+  res.json(result.repos);
+});
+
+app.get("/api/github/repos/:owner/:repo/branches", authMiddleware, async (req, res) => {
+  const result = await listRepoBranches(req.params.owner as string, req.params.repo as string);
+  if (!result.success) {
+    res.status(502).json({ error: result.error });
+    return;
+  }
+  res.json(result.branches);
+});
+
+// ===== Project Routes =====
+app.get("/api/projects", authMiddleware, async (_req, res) => {
+  res.json(await store.getProjects());
+});
+
+app.post("/api/projects", authMiddleware, async (req, res) => {
+  if (req.user!.role !== "admin") {
+    res.status(403).json({ error: "Apenas admins podem criar projetos" });
+    return;
+  }
+
+  const { name, githubOwner, githubRepo, defaultBranch } = req.body;
+  if (!name || !githubOwner || !githubRepo) {
+    res.status(400).json({ error: "Nome, owner e repo são obrigatórios" });
+    return;
+  }
+
+  try {
+    const project = await store.createProject({
+      id: uuidv4(),
+      name,
+      githubOwner,
+      githubRepo,
+      defaultBranch: defaultBranch || "main",
+    });
+    io.emit("project:created", project);
+    res.status(201).json(project);
+  } catch {
+    res.status(409).json({ error: "Projeto com este owner/repo já existe" });
+  }
+});
+
+app.put("/api/projects/:id", authMiddleware, async (req, res) => {
+  if (req.user!.role !== "admin") {
+    res.status(403).json({ error: "Apenas admins podem editar projetos" });
+    return;
+  }
+
+  const { name, githubOwner, githubRepo, defaultBranch, active } = req.body;
+  const project = await store.updateProject(req.params.id as string, { name, githubOwner, githubRepo, defaultBranch, active });
+  if (!project) {
+    res.status(404).json({ error: "Projeto não encontrado" });
+    return;
+  }
+  io.emit("project:updated", project);
+  res.json(project);
+});
+
+app.delete("/api/projects/:id", authMiddleware, async (req, res) => {
+  if (req.user!.role !== "admin") {
+    res.status(403).json({ error: "Apenas admins podem deletar projetos" });
+    return;
+  }
+
+  const id = req.params.id as string;
+  if (await store.deleteProject(id)) {
+    io.emit("project:deleted", id);
+    res.json({ ok: true });
+  } else {
+    res.status(404).json({ error: "Projeto não encontrado" });
+  }
+});
+
 // ===== Comment Routes =====
 app.get("/api/tasks/:taskId/comments", authMiddleware, async (req, res) => {
   const taskId = req.params.taskId as string;
@@ -187,11 +274,12 @@ io.use(socketAuthMiddleware);
 io.on("connection", async (socket) => {
   console.log(`Client connected: ${socket.id} (user: ${socket.data.user.id})`);
 
-  const [users, tasks] = await Promise.all([
+  const [users, tasks, projects] = await Promise.all([
     store.getUsers(),
     store.getTasks(),
+    store.getActiveProjects(),
   ]);
-  socket.emit("init", { developers: users, tasks });
+  socket.emit("init", { developers: users, tasks, projects });
 
   // User events
   socket.on("user:create", async (data: { name: string; email: string; avatar: string; color: string; role?: string }) => {
@@ -238,21 +326,56 @@ io.on("connection", async (socket) => {
   });
 
   // Task events
-  socket.on("task:create", async (data: Omit<Task, "id" | "createdAt" | "updatedAt">) => {
+  socket.on("task:create", async (data: Omit<Task, "id" | "createdAt" | "updatedAt" | "branches"> & { branchProjectIds?: string[] }) => {
     const now = new Date().toISOString();
+    const taskId = uuidv4();
+    const { branchProjectIds, ...taskData } = data;
+
     const task = await store.addTask({
-      ...data,
-      id: uuidv4(),
+      ...taskData,
+      id: taskId,
       createdAt: now,
       updatedAt: now,
     });
-    io.emit("task:created", task);
+
+    // Create branches on selected projects
+    const errors: string[] = [];
+    if (branchProjectIds && branchProjectIds.length > 0 && isGithubConfigured()) {
+      const shortId = taskId.split("-")[0];
+      const branchName = `task/${shortId}`;
+
+      for (const projectId of branchProjectIds) {
+        const project = await store.getProjectById(projectId);
+        if (!project) continue;
+
+        const result = await createBranch(project.githubOwner, project.githubRepo, project.defaultBranch, branchName);
+        if (result.success) {
+          await store.addTaskBranch({
+            id: uuidv4(),
+            taskId,
+            projectId,
+            branchName,
+          });
+        } else {
+          errors.push(`${project.name}: ${result.error}`);
+        }
+      }
+    }
+
+    // Re-fetch task with branches included
+    const tasks = await store.getTasks();
+    const fullTask = tasks.find((t) => t.id === taskId) || task;
+    io.emit("task:created", fullTask);
+
+    if (errors.length > 0) {
+      socket.emit("task:branch-error", { errors });
+    }
 
     // Notify assignee
-    if (task.assigneeId) {
-      const assignee = await store.getUserById(task.assigneeId);
+    if (fullTask.assigneeId) {
+      const assignee = await store.getUserById(fullTask.assigneeId);
       if (assignee?.email) {
-        taskAssignedEmail(assignee.email, assignee.name, task.title, STATUS_LABEL[task.status] || task.status);
+        taskAssignedEmail(assignee.email, assignee.name, fullTask.title, STATUS_LABEL[fullTask.status] || fullTask.status);
       }
     }
   });
@@ -301,6 +424,26 @@ io.on("connection", async (socket) => {
 
   socket.on("task:delete", async (id: string) => {
     if (await store.deleteTask(id)) io.emit("task:deleted", id);
+  });
+
+  // Subtask events
+  socket.on("subtask:create", async ({ taskId, title }: { taskId: string; title: string }) => {
+    if (!title.trim()) return;
+    const subtask = await store.addSubtask({ id: uuidv4(), title: title.trim(), taskId });
+    io.emit("subtask:created", subtask);
+  });
+
+  socket.on("subtask:toggle", async (id: string) => {
+    const subtask = await store.toggleSubtask(id);
+    if (subtask) io.emit("subtask:toggled", subtask);
+  });
+
+  socket.on("subtask:delete", async (id: string) => {
+    const subtask = await prisma.subtask.findUnique({ where: { id } });
+    if (!subtask) return;
+    if (await store.deleteSubtask(id)) {
+      io.emit("subtask:deleted", { id, taskId: subtask.taskId });
+    }
   });
 
   // Comment events

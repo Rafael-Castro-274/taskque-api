@@ -1,6 +1,6 @@
 import { prisma } from "./db.js";
-import type { User, Task, Comment } from "./types.js";
-import type { User as PrismaUser, Task as PrismaTask } from "./generated/prisma/client.js";
+import type { User, Task, Comment, Project, TaskBranch, Subtask } from "./types.js";
+import type { User as PrismaUser, Task as PrismaTask, Project as PrismaProject } from "./generated/prisma/client.js";
 
 function toUser(row: PrismaUser): User {
   return {
@@ -16,7 +16,10 @@ function toUser(row: PrismaUser): User {
   };
 }
 
-function toTask(row: PrismaTask): Task {
+function toTask(row: PrismaTask & {
+  branches?: Array<{ id: string; taskId: string; projectId: string; branchName: string; createdAt: Date; project: PrismaProject }>;
+  subtasks?: Array<{ id: string; title: string; done: boolean; taskId: string; createdAt: Date }>;
+}): Task {
   return {
     id: row.id,
     title: row.title,
@@ -24,10 +27,37 @@ function toTask(row: PrismaTask): Task {
     status: row.status,
     priority: row.priority,
     assigneeId: row.assigneeId,
+    branches: (row.branches || []).map((b) => ({
+      id: b.id,
+      taskId: b.taskId,
+      projectId: b.projectId,
+      projectName: b.project.name,
+      branchName: b.branchName,
+      createdAt: b.createdAt.toISOString(),
+    })),
+    subtasks: (row.subtasks || []).map((s) => ({
+      id: s.id,
+      title: s.title,
+      done: s.done,
+      taskId: s.taskId,
+      createdAt: s.createdAt.toISOString(),
+    })),
     startDate: row.startDate ? row.startDate.toISOString().split("T")[0] : null,
     endDate: row.endDate ? row.endDate.toISOString().split("T")[0] : null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+function toProject(row: PrismaProject): Project {
+  return {
+    id: row.id,
+    name: row.name,
+    githubOwner: row.githubOwner,
+    githubRepo: row.githubRepo,
+    defaultBranch: row.defaultBranch,
+    active: row.active,
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
@@ -111,11 +141,14 @@ export const store = {
 
   // Tasks
   async getTasks(): Promise<Task[]> {
-    const rows = await prisma.task.findMany({ orderBy: { createdAt: "asc" } });
+    const rows = await prisma.task.findMany({
+      orderBy: { createdAt: "asc" },
+      include: { branches: { include: { project: true } }, subtasks: { orderBy: { createdAt: "asc" } } },
+    });
     return rows.map(toTask);
   },
 
-  async addTask(task: Task): Promise<Task> {
+  async addTask(task: Omit<Task, "branches"> & { branches?: TaskBranch[] }): Promise<Task> {
     const row = await prisma.task.create({
       data: {
         id: task.id,
@@ -129,6 +162,7 @@ export const store = {
         createdAt: new Date(task.createdAt),
         updatedAt: new Date(task.updatedAt),
       },
+      include: { branches: { include: { project: true } }, subtasks: { orderBy: { createdAt: "asc" } } },
     });
     return toTask(row);
   },
@@ -145,7 +179,11 @@ export const store = {
     if (data.endDate !== undefined) updateData.endDate = data.endDate ? new Date(data.endDate) : null;
 
     try {
-      const row = await prisma.task.update({ where: { id }, data: updateData });
+      const row = await prisma.task.update({
+        where: { id },
+        data: updateData,
+        include: { branches: { include: { project: true } }, subtasks: { orderBy: { createdAt: "asc" } } },
+      });
       return toTask(row);
     } catch {
       return null;
@@ -155,6 +193,87 @@ export const store = {
   async deleteTask(id: string): Promise<boolean> {
     try {
       await prisma.task.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // Projects
+  async getProjects(): Promise<Project[]> {
+    const rows = await prisma.project.findMany({ orderBy: { name: "asc" } });
+    return rows.map(toProject);
+  },
+
+  async getActiveProjects(): Promise<Project[]> {
+    const rows = await prisma.project.findMany({ where: { active: true }, orderBy: { name: "asc" } });
+    return rows.map(toProject);
+  },
+
+  async getProjectById(id: string): Promise<Project | null> {
+    const row = await prisma.project.findUnique({ where: { id } });
+    return row ? toProject(row) : null;
+  },
+
+  async createProject(data: { id: string; name: string; githubOwner: string; githubRepo: string; defaultBranch: string }): Promise<Project> {
+    const row = await prisma.project.create({ data });
+    return toProject(row);
+  },
+
+  async updateProject(id: string, data: Partial<Pick<Project, "name" | "githubOwner" | "githubRepo" | "defaultBranch" | "active">>): Promise<Project | null> {
+    try {
+      const row = await prisma.project.update({ where: { id }, data });
+      return toProject(row);
+    } catch {
+      return null;
+    }
+  },
+
+  async deleteProject(id: string): Promise<boolean> {
+    try {
+      await prisma.project.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // Task Branches
+  async addTaskBranch(data: { id: string; taskId: string; projectId: string; branchName: string }): Promise<TaskBranch> {
+    const row = await prisma.taskBranch.create({
+      data,
+      include: { project: true },
+    });
+    return {
+      id: row.id,
+      taskId: row.taskId,
+      projectId: row.projectId,
+      projectName: row.project.name,
+      branchName: row.branchName,
+      createdAt: row.createdAt.toISOString(),
+    };
+  },
+
+  // Subtasks
+  async addSubtask(data: { id: string; title: string; taskId: string }): Promise<Subtask> {
+    const row = await prisma.subtask.create({ data });
+    return { id: row.id, title: row.title, done: row.done, taskId: row.taskId, createdAt: row.createdAt.toISOString() };
+  },
+
+  async toggleSubtask(id: string): Promise<Subtask | null> {
+    try {
+      const current = await prisma.subtask.findUnique({ where: { id } });
+      if (!current) return null;
+      const row = await prisma.subtask.update({ where: { id }, data: { done: !current.done } });
+      return { id: row.id, title: row.title, done: row.done, taskId: row.taskId, createdAt: row.createdAt.toISOString() };
+    } catch {
+      return null;
+    }
+  },
+
+  async deleteSubtask(id: string): Promise<boolean> {
+    try {
+      await prisma.subtask.delete({ where: { id } });
       return true;
     } catch {
       return false;
