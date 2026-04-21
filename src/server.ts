@@ -13,7 +13,7 @@ import {
   authMiddleware,
   socketAuthMiddleware,
 } from "./auth.js";
-import type { User, Task, Project } from "./types.js";
+import type { User, Task, Project, Sprint } from "./types.js";
 import { COLUMNS } from "./types.js";
 import { welcomeEmail, taskAssignedEmail, taskStatusEmail } from "./mail.js";
 import { createBranch, isGithubConfigured, listUserRepos, listRepoBranches } from "./github.js";
@@ -274,12 +274,13 @@ io.use(socketAuthMiddleware);
 io.on("connection", async (socket) => {
   console.log(`Client connected: ${socket.id} (user: ${socket.data.user.id})`);
 
-  const [users, tasks, projects] = await Promise.all([
+  const [users, tasks, projects, sprints] = await Promise.all([
     store.getUsers(),
     store.getTasks(),
     store.getActiveProjects(),
+    store.getSprints(),
   ]);
-  socket.emit("init", { developers: users, tasks, projects });
+  socket.emit("init", { developers: users, tasks, projects, sprints });
 
   // User events
   socket.on("user:create", async (data: { name: string; email: string; avatar: string; color: string; role?: string }) => {
@@ -326,7 +327,7 @@ io.on("connection", async (socket) => {
   });
 
   // Task events
-  socket.on("task:create", async (data: Omit<Task, "id" | "createdAt" | "updatedAt" | "branches"> & { branchProjectIds?: string[] }) => {
+  socket.on("task:create", async (data: Omit<Task, "id" | "createdAt" | "updatedAt" | "branches"> & { branchProjectIds?: string[]; sprintId?: string | null }) => {
     const now = new Date().toISOString();
     const taskId = uuidv4();
     const { branchProjectIds, ...taskData } = data;
@@ -471,6 +472,52 @@ io.on("connection", async (socket) => {
   socket.on("comment:list", async (taskId: string) => {
     const comments = await store.getCommentsByTaskId(taskId);
     socket.emit("comment:listed", { taskId, comments });
+  });
+
+  // Sprint events
+  socket.on("sprint:create", async (data: { name: string; goal?: string; startDate: string; endDate: string }) => {
+    if (socket.data.user.role !== "admin") return;
+    try {
+      const sprint = await store.createSprint({
+        id: uuidv4(),
+        name: data.name,
+        goal: data.goal || "",
+        startDate: data.startDate,
+        endDate: data.endDate,
+      });
+      io.emit("sprint:created", sprint);
+    } catch (err: unknown) {
+      socket.emit("sprint:error", { error: (err as Error).message });
+    }
+  });
+
+  socket.on("sprint:update", async ({ id, data }: { id: string; data: Partial<Pick<Sprint, "name" | "goal" | "startDate" | "endDate" | "status">> }) => {
+    if (socket.data.user.role !== "admin") return;
+    try {
+      const sprint = await store.updateSprint(id, data);
+      if (sprint) io.emit("sprint:updated", sprint);
+    } catch (err: unknown) {
+      socket.emit("sprint:error", { error: (err as Error).message });
+    }
+  });
+
+  socket.on("sprint:delete", async (id: string) => {
+    if (socket.data.user.role !== "admin") return;
+    if (await store.deleteSprint(id)) {
+      io.emit("sprint:deleted", id);
+      io.emit("tasks:sync", await store.getTasks());
+    }
+  });
+
+  socket.on("sprint:complete", async ({ id, moves }: { id: string; moves: { taskId: string; target: string | null }[] }) => {
+    if (socket.data.user.role !== "admin") return;
+    try {
+      const result = await store.completeSprint(id, moves);
+      io.emit("sprint:updated", result.sprint);
+      io.emit("tasks:sync", result.tasks);
+    } catch (err: unknown) {
+      socket.emit("sprint:error", { error: (err as Error).message });
+    }
   });
 
   socket.on("disconnect", () => {

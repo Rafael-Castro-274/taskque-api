@@ -1,6 +1,6 @@
 import { prisma } from "./db.js";
-import type { User, Task, Comment, Project, TaskBranch, Subtask } from "./types.js";
-import type { User as PrismaUser, Task as PrismaTask, Project as PrismaProject } from "./generated/prisma/client.js";
+import type { User, Task, Comment, Project, TaskBranch, Subtask, Sprint } from "./types.js";
+import type { User as PrismaUser, Task as PrismaTask, Project as PrismaProject, Sprint as PrismaSprint } from "./generated/prisma/client.js";
 
 function toUser(row: PrismaUser): User {
   return {
@@ -27,6 +27,7 @@ function toTask(row: PrismaTask & {
     status: row.status,
     priority: row.priority,
     assigneeId: row.assigneeId,
+    sprintId: row.sprintId,
     branches: (row.branches || []).map((b) => ({
       id: b.id,
       taskId: b.taskId,
@@ -58,6 +59,19 @@ function toProject(row: PrismaProject): Project {
     defaultBranch: row.defaultBranch,
     active: row.active,
     createdAt: row.createdAt.toISOString(),
+  };
+}
+
+function toSprint(row: PrismaSprint): Sprint {
+  return {
+    id: row.id,
+    name: row.name,
+    goal: row.goal,
+    startDate: row.startDate.toISOString().split("T")[0],
+    endDate: row.endDate.toISOString().split("T")[0],
+    status: row.status,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
   };
 }
 
@@ -157,6 +171,7 @@ export const store = {
         status: task.status,
         priority: task.priority,
         assigneeId: task.assigneeId,
+        sprintId: task.sprintId,
         startDate: task.startDate ? new Date(task.startDate) : null,
         endDate: task.endDate ? new Date(task.endDate) : null,
         createdAt: new Date(task.createdAt),
@@ -175,6 +190,7 @@ export const store = {
     if (data.status !== undefined) updateData.status = data.status;
     if (data.priority !== undefined) updateData.priority = data.priority;
     if (data.assigneeId !== undefined) updateData.assigneeId = data.assigneeId;
+    if (data.sprintId !== undefined) updateData.sprintId = data.sprintId;
     if (data.startDate !== undefined) updateData.startDate = data.startDate ? new Date(data.startDate) : null;
     if (data.endDate !== undefined) updateData.endDate = data.endDate ? new Date(data.endDate) : null;
 
@@ -278,6 +294,98 @@ export const store = {
     } catch {
       return false;
     }
+  },
+
+  // Sprints
+  async getSprints(): Promise<Sprint[]> {
+    const rows = await prisma.sprint.findMany({ orderBy: { startDate: "desc" } });
+    return rows.map(toSprint);
+  },
+
+  async getSprintById(id: string): Promise<Sprint | null> {
+    const row = await prisma.sprint.findUnique({ where: { id } });
+    return row ? toSprint(row) : null;
+  },
+
+  async createSprint(data: { id: string; name: string; goal: string; startDate: string; endDate: string; status?: Sprint["status"] }): Promise<Sprint> {
+    if (data.status === "active") {
+      const existing = await prisma.sprint.findFirst({ where: { status: "active" } });
+      if (existing) throw new Error("Já existe um sprint ativo");
+    }
+    const row = await prisma.sprint.create({
+      data: {
+        id: data.id,
+        name: data.name,
+        goal: data.goal,
+        startDate: new Date(data.startDate),
+        endDate: new Date(data.endDate),
+        status: data.status || "planning",
+      },
+    });
+    return toSprint(row);
+  },
+
+  async updateSprint(id: string, data: Partial<Pick<Sprint, "name" | "goal" | "startDate" | "endDate" | "status">>): Promise<Sprint | null> {
+    if (data.status === "active") {
+      const existing = await prisma.sprint.findFirst({ where: { status: "active", id: { not: id } } });
+      if (existing) throw new Error("Já existe um sprint ativo");
+    }
+    const updateData: Record<string, unknown> = {};
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.goal !== undefined) updateData.goal = data.goal;
+    if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
+    if (data.endDate !== undefined) updateData.endDate = new Date(data.endDate);
+    if (data.status !== undefined) updateData.status = data.status;
+
+    if (Object.keys(updateData).length === 0) return null;
+
+    try {
+      const row = await prisma.sprint.update({ where: { id }, data: updateData });
+      return toSprint(row);
+    } catch {
+      return null;
+    }
+  },
+
+  async deleteSprint(id: string): Promise<boolean> {
+    try {
+      await prisma.$transaction([
+        prisma.task.updateMany({ where: { sprintId: id }, data: { sprintId: null } }),
+        prisma.sprint.delete({ where: { id } }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  async completeSprint(id: string, moves: { taskId: string; target: string | null }[]): Promise<{ sprint: Sprint; tasks: Task[] }> {
+    return await prisma.$transaction(async (tx) => {
+      // Set sprint status to completed
+      const sprintRow = await tx.sprint.update({ where: { id }, data: { status: "completed" } });
+
+      // Move incomplete tasks according to moves array
+      for (const move of moves) {
+        await tx.task.update({
+          where: { id: move.taskId },
+          data: { sprintId: move.target },
+        });
+      }
+
+      // Set done tasks' sprintId to null (they're completed, no longer in sprint)
+      await tx.task.updateMany({
+        where: { sprintId: id, status: "done" },
+        data: { sprintId: null },
+      });
+
+      // Fetch all updated tasks
+      const taskRows = await tx.task.findMany({
+        orderBy: { createdAt: "asc" },
+        include: { branches: { include: { project: true } }, subtasks: { orderBy: { createdAt: "asc" } } },
+      });
+
+      return { sprint: toSprint(sprintRow), tasks: taskRows.map(toTask) };
+    });
   },
 
   // Comments

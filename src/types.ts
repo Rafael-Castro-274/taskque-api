@@ -27,10 +27,24 @@ export interface Task {
   status: "backlog" | "todo" | "in_progress" | "review" | "done";
   priority: "low" | "medium" | "high" | "urgent";
   assigneeId: string | null;
+  sprintId: string | null;
   branches: TaskBranch[];
   subtasks: Subtask[];
   startDate: string | null;
   endDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type SprintStatus = "planning" | "active" | "completed";
+
+export interface Sprint {
+  id: string;
+  name: string;
+  goal: string;
+  startDate: string;
+  endDate: string;
+  status: SprintStatus;
   createdAt: string;
   updatedAt: string;
 }
